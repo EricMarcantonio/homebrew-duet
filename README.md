@@ -7,6 +7,13 @@ on two pairs of Bluetooth headphones at once, each with its own volume.
 brew install --cask EricMarcantonio/duet/duet
 ```
 
+Homebrew 7 does not load casks from third-party taps until you trust them. If the
+command above refuses, run this once first:
+
+```sh
+brew trust ericmarcantonio/duet
+```
+
 Use that tap-qualified name. Homebrew's core tap already ships a cask called `duet`
 (Duet Display, the iPad-as-a-second-screen tool), so a bare `brew install --cask duet`
 installs that app instead of this one.
