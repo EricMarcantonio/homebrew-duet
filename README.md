@@ -44,14 +44,27 @@ brew uninstall --zap --cask duet # also removes ~/Library/Application Support/Du
 
 ## Maintaining this tap
 
-`Casks/d/duet.rb` is a byte-for-byte copy of
+`Casks/d/duet.rb` is kept current by
+[`.github/workflows/cask-repair.yml`](.github/workflows/cask-repair.yml). Every six hours —
+and on demand via `workflow_dispatch` — it asks duet for its latest release, downloads
+`Duet-macOS.zip`, and compares the real digest with the one pinned here. If a release
+asset was rebuilt after it was pinned (which changes its digest and breaks
+`brew install`), the workflow rewrites `version` and `sha256` in one commit and pushes to
+`main`. A run with nothing to do makes no commit.
+
+So the tap is the authoritative copy for installs; the cask in duet's
 [`packaging/homebrew/duet.rb`](https://github.com/EricMarcantonio/duet/blob/main/packaging/homebrew/duet.rb)
-in the main repository. On every release, regenerate the digest there and copy it over:
+is a mirror regenerated at release time with `scripts/update-cask.sh`. Nothing has to be
+copied by hand any more. A stale digest still fails closed — Homebrew refuses to install a
+zip whose sha256 does not match — and the repair is automatic within six hours.
+
+To force a repair now:
 
 ```sh
-cd ~/dev/duet && scripts/update-cask.sh v0.4.0
-cp packaging/homebrew/duet.rb ../homebrew-duet/Casks/d/duet.rb
+gh workflow run cask-repair.yml --repo EricMarcantonio/homebrew-duet
+gh run watch --repo EricMarcantonio/homebrew-duet
 ```
 
-A stale digest fails closed — Homebrew refuses to install a zip whose sha256 does not
-match — so a forgotten copy is a loud error, never a wrong binary.
+A digest is only ever pinned from a complete download: the byte count is checked against
+the size the release reports, so a half-uploaded asset aborts the run instead of being
+committed.

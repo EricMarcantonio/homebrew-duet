@@ -1,0 +1,185 @@
+name: Cask repair
+
+# Keeps Casks/d/duet.rb's `version` and `sha256` pointing at the assets actually
+# attached to duet's latest release.
+#
+# A release asset can be replaced after the cask was pinned — that is how v0.3.0
+# shipped a digest that no longer matched its zip — and GitHub fires no event for
+# "asset replaced on an existing release". The schedule is therefore the only
+# trigger that survives an out-of-band rebuild; `workflow_dispatch` exists to
+# repair on demand.
+#
+# No cross-repository secret: the tap's own GITHUB_TOKEN writes to the tap.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *" # off the hour, four times a day
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A manual run must not race the schedule into two commits.
+concurrency:
+  group: cask-repair
+  cancel-in-progress: false
+
+env:
+  CASK: Casks/d/duet.rb
+  ARTIFACT: Duet-macOS.zip
+  UPSTREAM: EricMarcantonio/duet
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Decide whether there is anything to do at all. Two paths are normal
+      # "nothing to do" exits: a draft/prerelease (never an install target) and a
+      # release whose assets are still uploading. Anything unreadable is an error.
+      - name: Resolve the latest release
+        id: release
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$UPSTREAM/releases/latest")"
+          tag="$(jq -r '.tag_name' <<<"$release")"
+          version="${tag#v}"
+          size="$(jq -r --arg n "$ARTIFACT" \
+            '.assets[] | select(.name == $n) | .size' <<<"$release")"
+          echo "latest release: $tag, $ARTIFACT: ${size:-absent} bytes"
+
+          echo "go=false" >>"$GITHUB_OUTPUT"
+
+          if [ "$(jq -r '.draft or .prerelease' <<<"$release")" = true ]; then
+            echo "::notice::the latest release is a draft or prerelease; nothing to pin"
+            exit 0
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::$tag is not an X.Y.Z tag, so the cask cannot express it"
+            exit 1
+          fi
+          if [ -z "$size" ] || [ "$size" = "null" ] || [ "$size" -le 0 ]; then
+            echo "::notice::$tag has no $ARTIFACT yet; its build is probably still uploading"
+            exit 0
+          fi
+
+          {
+            echo "go=true"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "size=$size"
+          } >>"$GITHUB_OUTPUT"
+
+      # A digest is only worth pinning if it came from a complete file, so the
+      # byte count is checked against the size the API reported.
+      - name: Download the macOS asset and hash it
+        if: steps.release.outputs.go == 'true'
+        id: asset
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          gh release download "${{ steps.release.outputs.tag }}" --repo "$UPSTREAM" \
+            --pattern "$ARTIFACT" --dir "$tmp"
+          got="$(wc -c <"$tmp/$ARTIFACT" | tr -d ' ')"
+          want="${{ steps.release.outputs.size }}"
+          if [ "$got" != "$want" ]; then
+            echo "::error::downloaded $got bytes, the release reports $want"
+            exit 1
+          fi
+          sha="$(sha256sum "$tmp/$ARTIFACT" | cut -d' ' -f1)"
+          echo "sha256 $sha ($got bytes)"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+
+      # Version and digest always move in the same commit, so the tap never names
+      # a version whose artifact it does not have the digest for.
+      - name: Pin the cask, if it disagrees
+        if: steps.release.outputs.go == 'true'
+        id: pin
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          sha="${{ steps.asset.outputs.sha }}"
+          have_version="$(awk -F'"' '/^  version /{print $2}' "$CASK")"
+          have_sha="$(awk -F'"' '/^  sha256 /{print $2}' "$CASK")"
+          echo "cask: version $have_version, sha256 $have_sha"
+
+          echo "changed=false" >>"$GITHUB_OUTPUT"
+          if [ "$have_version" = "$version" ] && [ "$have_sha" = "$sha" ]; then
+            echo "::notice::already pinned to $version and the current asset digest"
+            exit 0
+          fi
+
+          # Anchored rewrite, the same shape duet's scripts/update-cask.sh uses, so a
+          # cask edited into a different shape fails here instead of being mangled.
+          awk -v version="$version" -v sha="$sha" '
+            /^  version "[^"]*"$/ { print "  version \"" version "\""; next }
+            /^  sha256 "[^"]*"$/  { print "  sha256 \"" sha "\""; next }
+            { print }
+          ' "$CASK" >"$CASK.new"
+          written="$(grep -c -e "^  version \"$version\"$" -e "^  sha256 \"$sha\"$" "$CASK.new" || true)"
+          if [ "$written" -ne 2 ]; then
+            echo "::error::could not write version and sha256 into $CASK (wanted 2 lines, got $written)"
+            exit 1
+          fi
+          mv "$CASK.new" "$CASK"
+
+          if git diff --quiet -- "$CASK"; then
+            echo "::warning::the rewrite produced no diff while the pin disagreed; refusing to continue"
+            exit 1
+          fi
+
+          {
+            echo "changed=true"
+            echo "have_version=$have_version"
+            echo "have_sha=$have_sha"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo "### Cask repair"
+            echo ""
+            echo "| | before | after |"
+            echo "|---|---|---|"
+            echo "| version | \`$have_version\` | \`$version\` |"
+            echo "| sha256 | \`$have_sha\` | \`$sha\` |"
+            echo ""
+            echo "Asset: $ARTIFACT for ${{ steps.release.outputs.tag }}"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # Digest correctness keeps installs working; a cosmetic offense must never
+      # wedge the repair, so this is logged and never fatal.
+      - name: Lint the cask (best effort)
+        if: steps.pin.outputs.changed == 'true'
+        run: |
+          out="$(brew style --cask "$CASK" 2>&1 || true)"
+          printf '%s\n' "$out"
+          if grep -q 'Loading casks from paths' <<<"$out"; then
+            echo "::notice::this Homebrew cannot lint a cask from a path; style skipped"
+          fi
+
+      - name: Commit and push
+        if: steps.pin.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA: ${{ steps.asset.outputs.sha }}
+          HAVE_VERSION: ${{ steps.pin.outputs.have_version }}
+          HAVE_SHA: ${{ steps.pin.outputs.have_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Values from the API go through printf, never into a shell-quoted string.
+          msg="$(mktemp)"
+          {
+            printf 'duet %s: pin sha256 %s\n\n' "$VERSION" "${SHA:0:12}"
+            printf 'The %s asset attached to %s no longer matched the pinned digest, so the\n' "$ARTIFACT" "$TAG"
+            printf 'cask could not be installed. It is now %s for version %s (was %s):\n' "$SHA" "$VERSION" "$HAVE_SHA"
+            printf 'previously pinned version %s.\n\n' "$HAVE_VERSION"
+            printf 'https://github.com/%s/releases/tag/%s\n' "$UPSTREAM" "$TAG"
+          } >"$msg"
+          git add "$CASK"
+          git commit -F "$msg"
+          git push
