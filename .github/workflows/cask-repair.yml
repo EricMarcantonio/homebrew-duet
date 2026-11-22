@@ -176,8 +176,10 @@ jobs:
           {
             printf 'duet %s: pin sha256 %s\n\n' "$VERSION" "${SHA:0:12}"
             printf 'The %s asset attached to %s no longer matched the pinned digest, so the\n' "$ARTIFACT" "$TAG"
-            printf 'cask could not be installed. It is now %s for version %s (was %s):\n' "$SHA" "$VERSION" "$HAVE_SHA"
-            printf 'previously pinned version %s.\n\n' "$HAVE_VERSION"
+            printf 'cask could not be installed.\n\n'
+            printf '  version  %s -> %s\n' "$HAVE_VERSION" "$VERSION"
+            printf '  sha256   %s -> %s\n\n' "$HAVE_SHA" "$SHA"
+            printf 'Repaired by .github/workflows/cask-repair.yml.\n'
             printf 'https://github.com/%s/releases/tag/%s\n' "$UPSTREAM" "$TAG"
           } >"$msg"
           git add "$CASK"
